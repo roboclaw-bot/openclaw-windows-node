@@ -17,6 +17,9 @@ internal sealed record SetupHandoffAcquisition(
 internal sealed class SetupDashboardHandoffStore
 {
     private static readonly TimeSpan Lifetime = TimeSpan.FromMinutes(5);
+    // Records issued before the longer WSL recovery budget retain their
+    // original, nonrenewable execution deadline across an app update.
+    private static readonly TimeSpan PreviousExecution = TimeSpan.FromSeconds(810);
     private readonly string _directory;
     private readonly TimeProvider _time;
     private string PendingPath => Path.Combine(_directory, "pending.json");
@@ -35,14 +38,28 @@ internal sealed class SetupDashboardHandoffStore
             throw new SetupNativeOwnershipException();
         if (!IsValidCompletion(completion.Verification))
             throw new InvalidOperationException("AI completion has no verified Gateway binding.");
+        return IssueCore(completion.Verification, completion.Target, null);
+    }
+
+    public string IssuePreparation(SetupNativePreparation preparation)
+    {
+        if (!preparation.IsValid || !IsValidCompletion(preparation.Verification))
+            throw new SetupNativeOwnershipException();
+        return IssueCore(preparation.Verification, null, preparation.SessionKey);
+    }
+
+    private string IssueCore(GatewayAiSetupCompletion proof, SetupNativeTarget? target, string? preparationSession)
+    {
         Directory.CreateDirectory(_directory);
         RequireOwnedDirectory();
         using var gate = OpenGate();
         var handle = SetupDashboardHandoff.NativePrefix +
             Convert.ToHexString(RandomNumberGenerator.GetBytes(32)).ToLowerInvariant();
         var now = _time.GetUtcNow();
-        Write(new PendingRecord(Guid.NewGuid().ToString("N"), Hash(handle), completion.Verification,
-            now, now + Lifetime, "ready", completion.Target));
+        // Both kinds explicitly supersede the one pending record under the same gate.
+        Write(new PendingRecord(Guid.NewGuid().ToString("N"), Hash(handle), proof,
+            now, now + Lifetime, "ready", target, Kind: preparationSession is null ? "destination-v1" : "preparation-v1",
+            PreparationSession: preparationSession));
         return handle;
     }
 
@@ -82,7 +99,7 @@ internal sealed class SetupDashboardHandoffStore
             catch (JsonException) { return new(SetupHandoffAcquisitionStatus.Invalid); }
             input.Dispose();
             if (pending is null || !IsValidCompletion(pending.Completion) ||
-                pending.NativeTarget is not { } target || !target.Matches(pending.Completion) ||
+                !HasValidTarget(pending) ||
                 pending.HandleHash != Hash(handle!) || !Guid.TryParseExact(pending.RunId, "N", out _) ||
                 pending.ExpiresUtc - pending.IssuedUtc != Lifetime)
                 return new(SetupHandoffAcquisitionStatus.Invalid);
@@ -92,7 +109,8 @@ internal sealed class SetupDashboardHandoffStore
             if ((executionStarted is null) != (executionExpires is null) ||
                 (executionStarted is { } started &&
                 (started < pending.IssuedUtc || started >= pending.ExpiresUtc || now < started ||
-                 executionExpires - started != SetupNativeCompletionTiming.Execution)) ||
+                 executionExpires - started != SetupNativeCompletionTiming.Execution &&
+                 executionExpires - started != PreviousExecution)) ||
                 (pending.State == "ready" && executionStarted is not null) ||
                 (pending.State is "retry" or "inflight" && executionStarted is null))
                 return new(SetupHandoffAcquisitionStatus.Invalid);
@@ -157,6 +175,16 @@ internal sealed class SetupDashboardHandoffStore
     private static string Hash(string handle) =>
         Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(handle)));
 
+    private static bool HasValidTarget(PendingRecord pending) => pending.Kind switch
+    {
+        // Existing receipts predate the explicit kind.
+        null or "destination-v1" => pending.PreparationSession is null &&
+            pending.NativeTarget is { } target && target.Matches(pending.Completion),
+        "preparation-v1" => pending.NativeTarget is null &&
+            SetupNativePreparation.Matches(pending.Completion, pending.PreparationSession),
+        _ => false,
+    };
+
     private static bool IsValidCompletion(GatewayAiSetupCompletion? value) =>
         value is { VerifiedGeneration: > 0, ModelTarget: null } &&
         SetupCompletionAuthority.IsValid(value.IdentityBinding, value.SessionKey, value.AgentId) &&
@@ -167,7 +195,8 @@ internal sealed class SetupDashboardHandoffStore
     internal sealed record PendingRecord(
         string RunId, string HandleHash, GatewayAiSetupCompletion Completion,
         DateTimeOffset IssuedUtc, DateTimeOffset ExpiresUtc, string State, SetupNativeTarget? NativeTarget = null,
-        DateTimeOffset? ExecutionStartedUtc = null, DateTimeOffset? ExecutionExpiresUtc = null);
+        DateTimeOffset? ExecutionStartedUtc = null, DateTimeOffset? ExecutionExpiresUtc = null,
+        string? Kind = null, string? PreparationSession = null);
 
     internal sealed class Lease : IDisposable
     {
@@ -178,6 +207,8 @@ internal sealed class SetupDashboardHandoffStore
         private bool _disposed;
         public GatewayAiSetupCompletion Completion => _pending.Completion;
         public SetupNativeTarget? NativeTarget => _pending.NativeTarget;
+        public bool IsPreparation => _pending.Kind == "preparation-v1";
+        public string SessionKey => IsPreparation ? _pending.PreparationSession! : _pending.NativeTarget!.SessionKey;
         private DateTimeOffset ExecutionExpiresUtc => _pending.ExecutionExpiresUtc!.Value;
         public bool IsExpired => _owner._time.GetUtcNow() >= ExecutionExpiresUtc ||
             _owner._time.GetUtcNow() < _pending.ExecutionStartedUtc!.Value;
