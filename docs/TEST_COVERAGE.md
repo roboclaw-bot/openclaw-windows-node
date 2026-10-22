@@ -56,8 +56,9 @@ per-run artifacts. Existing MCP-only integration defaults remain unchanged.
 ### OpenClaw.Shared.Tests
 
 - **Command output-drain timing** - The unsupported-Windows runner fixture gates launcher release, then requires completion within three seconds of root exit while a descendant retains stdout, stderr, or both. Ten repetitions per case check short output and PID/start-time-bound child cleanup. The nonparallel `MxcOwnership` collection isolates these wall-clock budgets from unrelated tests. Native SDK finalization has separate managed ownership tests and opt-in runtime proof.
+- **Fixture process identity** - MXC pipe-fixture metadata, cleanup ownership checks, and the opt-in native MXC descendant-identity check query the observed full executable image through a retained process handle, not the loader's nullable `MainModule` or a requested launch path. `ProcessImagePathTests` checks a real, never-resumed Windows process with no initialized loader view, a different command-line image name, caller-handle lifetime, and explicit native query failure. This deterministically covers unavailable loader metadata; it does not reproduce the timing of a normally scheduled child or prove native MXC containment.
 - **Model and display formatting** - activity glyphs, app version display, session labels, gateway usage/node display, channel status, and rich text helpers.
-- **Gateway and WebSocket behavior** - gateway client parsing, session keys, WebSocket base handling, URL normalization, local gateway classification, and token sanitization. The signing-identity regression covers native and managed loopback WebSockets, with the fixture completing the close handshake and bounding disconnect waits.
+- **Gateway and WebSocket behavior** - gateway client parsing, session keys, WebSocket base handling, URL normalization, local gateway classification, and token sanitization. The signing-identity regression covers native and managed loopback WebSockets with a bounded client-initiated disconnect and a queued health request. The fixture drains application frames already in flight until the client's close frame, replies, and closes its transport under one deadline rather than relying on the client's EOF fallback timer. A separate fixture regression checks the close frame and actual TCP EOF on both transports, including fragmented text and binary data queued before close.
 - **Capabilities and MCP** - app/canvas/screen/camera/system capabilities, MCP auth token reset, MCP HTTP server, MCP tool bridge, MXC availability, MXC policy building, and command runners.
 - **Exec approval** - legacy policy coverage plus V2 evaluator, input validation, normalization, prompt adapter, routing, coordinator, store, environment sanitizing, and shell-wrapper parsing.
 - **A2UI and web bridge** - A2UI capability security, asset hash pinning, web bridge message handling, and channel payload/status tests.
@@ -293,6 +294,13 @@ The WSL E2E fixture installs npm `latest` by default.
 package test. Running the packaging repository's pinned npm version in WSL does
 not prove Microsoft Store acquisition, package identity, MXC session setup, or
 the packaged Gateway lifecycle.
+
+Both E2E tray fixtures read `gateways.json` through `GatewayRegistryFile`, which
+joins the production `PersistenceFileLease` before opening the file. This keeps
+fixture reads out of an in-flight atomic replacement without retrying IO or
+hiding malformed JSON. The fixture-free `SetupAndConnectTestsRegistryReads`
+regressions cover writer/reader ordering, concurrent saves and error propagation;
+they do not replace the real WSL Gateway setup/connect proofs.
 
 Actual package E2E needs a disposable Windows account/host with a successful
 MXC session capability probe and a verified installable MSIX from
